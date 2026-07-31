@@ -1,141 +1,60 @@
-from __future__ import annotations
-import asyncio, logging
-from telegram.ext import ApplicationBuilder, CommandHandler
-from telegram.constants import ParseMode
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+import os
+import feedparser
+import asyncio
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-from .config import (
-    TELEGRAM_BOT_TOKEN,
-    TELEGRAM_CHANNEL_ID,
-    NEWS_FEED_URL,
-    SCRAPE_INTERVAL_SECONDS,
-    SCRAPE_MODE,
-)
-from . import db
-from .scraper import fetch_from_rss, fetch_from_html
-from .openai_helper import summarize
+# === НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ===
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID")
+RSS_URL = os.environ.get("NEWS_FEED_URL")
+INTERVAL = int(os.environ.get("SCRAPE_INTERVAL_SECONDS", 3600))
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
-log = logging.getLogger("newsbot")
-
-
-# ========== Постинг одной новости ==========
-async def _post_item(application, item: dict):
-    title = item['title']
-    url = item['url']
-    summary = item.get("summary", "")
-
-    # Если есть картинка
-    image = item.get("image")
-
-    # Кнопка "Читать подробнее"
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📖 Читать подробнее", url=url)]
-    ])
-
-    # Формируем текст
-    text = f"<b>{title}</b>\n\n{summary}"
-
+# === ФУНКЦИЯ ПОСТИНГА ===
+async def scheduled_post(context: ContextTypes.DEFAULT_TYPE):
+    """Парсит RSS и отправляет новость в канал"""
     try:
-        if image:
-            await application.bot.send_photo(
-                chat_id=TELEGRAM_CHANNEL_ID,
-                photo=image,
-                caption=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=keyboard
-            )
-        else:
-            await application.bot.send_message(
-                chat_id=TELEGRAM_CHANNEL_ID,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=keyboard
-            )
+        feed = feedparser.parse(RSS_URL)
+        if feed.entries:
+            entry = feed.entries[0]
+            title = entry.title
+            link = entry.link
+            # Формируем пост
+            message = f"📰 {title}\n\n🔗 {link}"
+            await context.bot.send_message(chat_id=CHANNEL_ID, text=message)
     except Exception as e:
-        log.error(f"Ошибка при отправке поста: {e}")
+        print(f"Ошибка при публикации: {e}")
 
+# === КОМАНДА /LATEST ===
+async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправить последнюю новость вручную"""
+    await scheduled_post(context)
 
-# ========== Парсинг и публикация ==========
-async def scrape_and_post(application):
-    log.info("Scraping...")
-    if not NEWS_FEED_URL:
-        log.warning("NEWS_FEED_URL not configured; skip")
-        return
-
-    # Получаем список новостей
-    if SCRAPE_MODE.lower() == "html":
-        items = fetch_from_html(
-            NEWS_FEED_URL,
-            item_selector="article",
-            title_selector="h2",
-            link_selector="a",
-        )
-    else:
-        items = fetch_from_rss(NEWS_FEED_URL)
-
-    # Берём только новые
-    fresh = [it for it in items if not db.seen(it["id"])]
-    if not fresh:
-        log.info("No new items")
-        return
-
-    # Ограничиваем максимум 5 за раз
-    fresh = fresh[:2]
-
-    # От новых к старым
-    for it in reversed(fresh):
-        await _post_item(application, it)
-        db.mark_seen(it["id"], it["url"], it["title"], it.get("published"))
-        await asyncio.sleep(2)
-
-    log.info("Posted %d new items", len(fresh))
-
-
-# ========== Команды ==========
-async def cmd_start(update, context):
+# === КОМАНДА /START ===
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Бот активен ✅\n\n"
-        "Команды:\n"
-        "/latest — собрать и опубликовать свежие новости"
+        "📰 Бот для публикации новостей запущен!\n"
+        "Он будет автоматически постить новости в канал."
     )
 
-
-async def cmd_latest(update, context):
-    await update.message.reply_text("Собираю свежие новости...")
-    await scrape_and_post(context.application)
-    await update.message.reply_text("Готово ✅")
-
-
-# ========== Запуск ==========
+# === ЗАПУСК БОТА ===
 async def run():
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is empty")
-
-    db.init_db()
     app = Application.builder().token(BOT_TOKEN).build()
-# Явно создаём JobQueue
-from telegram.ext import JobQueue
-app.job_queue = JobQueue()
-app.job_queue.set_application(app)
 
+    # Добавляем обработчики команд
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("latest", cmd_latest))
 
-    # Автопостинг раз в 10 минут
-    app.job_queue.run_repeating(
-        lambda ctx: scrape_and_post(ctx.application),
-        interval=SCRAPE_INTERVAL_SECONDS or 600,
-        first=5,
-    )
+    # Инициализируем и запускаем JobQueue
+    if app.job_queue:
+        # Публикуем каждые INTERVAL секунд
+        app.job_queue.run_repeating(scheduled_post, interval=INTERVAL, first=10)
+    else:
+        print("⚠️ JobQueue не инициализирован. Планировщик не работает.")
 
-    await app.initialize()
-    await app.start()
+    # Запускаем бота
+    await app.run_polling()
 
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await app.stop()
-        await app.shutdown()
+# Точка входа
+if __name__ == "__main__":
+    asyncio.run(run())
