@@ -115,7 +115,11 @@ async def run():
         raise RuntimeError("TELEGRAM_BOT_TOKEN is empty")
 
     db.init_db()
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
+# Явно создаём JobQueue
+from telegram.ext import JobQueue
+app.job_queue = JobQueue()
+app.job_queue.set_application(app)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("latest", cmd_latest))
